@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::cmp::{self};
 use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 use anyhow::Result;
 
@@ -59,7 +57,17 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap = BinaryHeap::new();
+        for (idx, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                heap.push(HeapWrapper(idx, iter));
+            }
+        }
+        let current = heap.pop();
+        Self {
+            iters: heap,
+            current,
+        }
     }
 }
 
@@ -68,19 +76,68 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 {
     type KeyType<'a> = KeySlice<'a>;
 
-    fn key(&self) -> KeySlice {
-        unimplemented!()
+    fn key(&self) -> KeySlice<'_> {
+        self.current.as_ref().unwrap().1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map(|x| x.1.is_valid())
+            .unwrap_or(false)
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let current = self.current.as_mut().unwrap();
+
+        // Skip the same key in all other iterators; the current one has the highest priority.
+        while let Some(mut inner_iter) = self.iters.peek_mut() {
+            debug_assert!(
+                inner_iter.1.key() >= current.1.key(),
+                "heap invariant violated"
+            );
+            if inner_iter.1.key() != current.1.key() {
+                break;
+            }
+            if let e @ Err(_) = inner_iter.1.next() {
+                PeekMut::pop(inner_iter);
+                return e;
+            }
+            if !inner_iter.1.is_valid() {
+                PeekMut::pop(inner_iter);
+            }
+        }
+
+        current.1.next()?;
+
+        if !current.1.is_valid() {
+            self.current = self.iters.pop();
+            return Ok(());
+        }
+
+        // Swap with the heap top if it now has a smaller key (or the same key with higher priority).
+        if let Some(mut inner_iter) = self.iters.peek_mut()
+            && *current < *inner_iter
+        {
+            std::mem::swap(&mut *inner_iter, current);
+        }
+
+        Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iters
+            .iter()
+            .map(|x| x.1.num_active_iterators())
+            .sum::<usize>()
+            + self
+                .current
+                .as_ref()
+                .map(|x| x.1.num_active_iterators())
+                .unwrap_or(0)
     }
 }

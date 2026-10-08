@@ -14,8 +14,8 @@
 
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
-use anyhow::Result;
-use bytes::{BufMut, Bytes, BytesMut};
+use anyhow::{Result, bail};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Implements a bloom filter
 pub struct Bloom {
@@ -60,7 +60,17 @@ impl<T: AsMut<[u8]>> BitSliceMut for T {
 
 impl Bloom {
     /// Decode a bloom filter
+    ///
+    /// Layout: `| filter | k (u8) | checksum (u32) |`
     pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 5 {
+            bail!("bloom filter too short");
+        }
+        let checksum = (&buf[buf.len() - 4..]).get_u32();
+        let buf = &buf[..buf.len() - 4];
+        if checksum != crc32fast::hash(buf) {
+            bail!("bloom filter checksum mismatched");
+        }
         let filter = &buf[..buf.len() - 1];
         let k = buf[buf.len() - 1];
         Ok(Self {
@@ -71,8 +81,11 @@ impl Bloom {
 
     /// Encode a bloom filter
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        let offset = buf.len();
         buf.extend(&self.filter);
         buf.put_u8(self.k);
+        let checksum = crc32fast::hash(&buf[offset..]);
+        buf.put_u32(checksum);
     }
 
     /// Get bloom filter bits per key from entries count and FPR
@@ -93,7 +106,15 @@ impl Bloom {
         let mut filter = BytesMut::with_capacity(nbytes);
         filter.resize(nbytes, 0);
 
-        // TODO: build the bloom filter
+        for h in keys {
+            let mut h = *h;
+            let delta = h.rotate_left(15);
+            for _ in 0..k {
+                let bit_pos = (h as usize) % nbits;
+                filter.set_bit(bit_pos, true);
+                h = h.wrapping_add(delta);
+            }
+        }
 
         Self {
             filter: filter.freeze(),
@@ -108,10 +129,15 @@ impl Bloom {
             true
         } else {
             let nbits = self.filter.bit_len();
+            let mut h = h;
             let delta = h.rotate_left(15);
-
-            // TODO: probe the bloom filter
-
+            for _ in 0..self.k {
+                let bit_pos = h % (nbits as u32);
+                if !self.filter.get_bit(bit_pos as usize) {
+                    return false;
+                }
+                h = h.wrapping_add(delta);
+            }
             true
         }
     }
